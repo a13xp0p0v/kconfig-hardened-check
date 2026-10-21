@@ -44,6 +44,7 @@ def add_kconfig_checks(l: list[ChecklistObjType], arch: str) -> None:
     devmem_not_set = KconfigCheck('cut_attack_surface', 'kspp', 'DEVMEM', 'is not set')  # refers to LOCKDOWN
     bpf_syscall_not_set = KconfigCheck('cut_attack_surface', 'lockdown', 'BPF_SYSCALL', 'is not set')
                           # refers to LOCKDOWN
+    selinux_not_set = KconfigCheck('-', '-', 'SECURITY_SELINUX', 'is not set')
 
     # 'self_protection', 'defconfig'
     l += [KconfigCheck('self_protection', 'defconfig', 'BUG', 'y')]
@@ -79,7 +80,8 @@ def add_kconfig_checks(l: list[ChecklistObjType], arch: str) -> None:
     if arch in {'X86_64', 'ARM64', 'ARM', 'RISCV'}:
         l += [vmap_stack_is_set]
     if arch in {'X86_64', 'X86_32', 'RISCV'}:
-        l += [KconfigCheck('self_protection', 'defconfig', 'LSM_MMAP_MIN_ADDR', '65536')]
+        l += [OR(KconfigCheck('self_protection', 'defconfig', 'LSM_MMAP_MIN_ADDR', '65536'),
+                 selinux_not_set)]
     if arch in {'X86_64', 'X86_32'}:
         l += [KconfigCheck('self_protection', 'defconfig', 'DEBUG_WX', 'y')]
         l += [KconfigCheck('self_protection', 'defconfig', 'WERROR', 'y')]
@@ -164,7 +166,8 @@ def add_kconfig_checks(l: list[ChecklistObjType], arch: str) -> None:
         l += [KconfigCheck('self_protection', 'defconfig', 'ARM64_EPAN', 'y')]
         l += [KconfigCheck('self_protection', 'defconfig', 'UNMAP_KERNEL_AT_EL0', 'y')]
         l += [KconfigCheck('self_protection', 'defconfig', 'ARM64_E0PD', 'y')]
-        l += [KconfigCheck('self_protection', 'defconfig', 'RODATA_FULL_DEFAULT_ENABLED', 'y')]
+        l += [OR(KconfigCheck('self_protection', 'defconfig', 'RODATA_FULL_DEFAULT_ENABLED', 'y'),
+                 VersionCheck((6, 18, 0)))]  # removed in v6.18; full rodata protection is now the default
         l += [KconfigCheck('self_protection', 'defconfig', 'ARM64_PTR_AUTH_KERNEL', 'y')]
         l += [KconfigCheck('self_protection', 'defconfig', 'ARM64_BTI_KERNEL', 'y')]
         l += [KconfigCheck('self_protection', 'defconfig', 'ARM_SMMU', 'y')]
@@ -191,7 +194,9 @@ def add_kconfig_checks(l: list[ChecklistObjType], arch: str) -> None:
                  KconfigCheck('self_protection', 'defconfig', 'DEBUG_LIST', 'y'))]
 
     # 'self_protection', 'kspp'
-    l += [KconfigCheck('self_protection', 'kspp', 'RANDOM_KMALLOC_CACHES', 'y')]
+    l += [OR(KconfigCheck('self_protection', 'kspp', 'KMALLOC_PARTITION_CACHES', 'y'),
+             KconfigCheck('self_protection', 'kspp', 'RANDOM_KMALLOC_CACHES', 'y'))]
+             # KMALLOC_PARTITION_CACHES replaces the transitional RANDOM_KMALLOC_CACHES in Linux v7.2
     l += [KconfigCheck('self_protection', 'kspp', 'SLAB_BUCKETS', 'y')]
     l += [KconfigCheck('self_protection', 'kspp', 'SLAB_MERGE_DEFAULT', 'is not set')]
     l += [KconfigCheck('self_protection', 'kspp', 'BUG_ON_DATA_CORRUPTION', 'y')]
@@ -212,12 +217,16 @@ def add_kconfig_checks(l: list[ChecklistObjType], arch: str) -> None:
           # the BTC-RET attack harder (Branch Type Confusion for RET instructions, CVE-2022-29900)
     cfi_clang_is_set = KconfigCheck('self_protection', 'kspp', 'CFI_CLANG', 'y')
     cfi_clang_permissive_not_set = KconfigCheck('self_protection', 'kspp', 'CFI_PERMISSIVE', 'is not set')
+    cfi_is_set = KconfigCheck('self_protection', 'kspp', 'CFI', 'y')
+    cfi_permissive_not_set = KconfigCheck('self_protection', 'kspp', 'CFI_PERMISSIVE', 'is not set')
     l += [OR(KconfigCheck('self_protection', 'kspp', 'DEBUG_CREDENTIALS', 'y'),
              VersionCheck((6, 6, 8)))]  # DEBUG_CREDENTIALS was dropped in v6.6.8
     l += [OR(KconfigCheck('self_protection', 'kspp', 'DEBUG_NOTIFIERS', 'y'),
              AND(cfi_clang_is_set,
                  cfi_clang_permissive_not_set,
-                 cc_is_clang))]
+                 cc_is_clang),
+             AND(cfi_is_set,
+                 cfi_permissive_not_set))]
     kfence_is_set = KconfigCheck('self_protection', 'kspp', 'KFENCE', 'y')
     l += [kfence_is_set]
     l += [AND(KconfigCheck('self_protection', 'kspp', 'KFENCE_SAMPLE_INTERVAL', '100'),
@@ -358,14 +367,16 @@ def add_kconfig_checks(l: list[ChecklistObjType], arch: str) -> None:
 
     # 'self_protection', 'a13xp0p0v'
     if arch == 'ARM64':
-        l += [AND(KconfigCheck('self_protection', 'a13xp0p0v', 'LSM_MMAP_MIN_ADDR', '65536'),
-                  KconfigCheck('cut_attack_surface', 'kspp', 'COMPAT', 'is not set'))]
-                  # LSM_MMAP_MIN_ADDR=65536 for ARM64 requires disabled COMPAT (see security/Kconfig)
+        l += [OR(selinux_not_set,
+                 AND(KconfigCheck('self_protection', 'a13xp0p0v', 'LSM_MMAP_MIN_ADDR', '65536'),
+                     KconfigCheck('cut_attack_surface', 'kspp', 'COMPAT', 'is not set')))]
+                 # LSM_MMAP_MIN_ADDR applies only with SELinux; ARM64 also needs COMPAT disabled for 65536.
     if arch == 'ARM':
         l += [KconfigCheck('self_protection', 'a13xp0p0v', 'ARM_SMMU', 'y')]
         l += [KconfigCheck('self_protection', 'a13xp0p0v', 'ARM_SMMU_DISABLE_BYPASS_BY_DEFAULT', 'y')]
-        l += [KconfigCheck('self_protection', 'a13xp0p0v', 'LSM_MMAP_MIN_ADDR', '32768')]
-              # LSM_MMAP_MIN_ADDR is not in defconfig on ARM, unfortunately
+        l += [OR(KconfigCheck('self_protection', 'a13xp0p0v', 'LSM_MMAP_MIN_ADDR', '32768'),
+                 selinux_not_set)]
+              # LSM_MMAP_MIN_ADDR is SELinux-dependent and may be absent from defconfig.
 
     # 'security_policy'
     if arch in {'X86_64', 'ARM64', 'X86_32', 'RISCV'}:
@@ -720,8 +731,12 @@ def add_cmdline_checks(l: list[ChecklistObjType], arch: str) -> None:
                  AND(CmdlineCheck('self_protection', 'defconfig', 'mitigations', 'is not set'),
                      CmdlineCheck('-', '-', 'ssbd', 'is not set')))]
         l += [OR(CmdlineCheck('self_protection', 'defconfig', 'rodata', 'full'),
+                 AND(CmdlineCheck('self_protection', 'defconfig', 'rodata', 'on'),
+                     VersionCheck((6, 18, 0))),
                  AND(KconfigCheck('self_protection', 'defconfig', 'RODATA_FULL_DEFAULT_ENABLED', 'y'),
-                     CmdlineCheck('-', '-', 'rodata', 'is not set')))]
+                     CmdlineCheck('-', '-', 'rodata', 'is not set')),
+                 AND(CmdlineCheck('-', '-', 'rodata', 'is not set'),
+                     VersionCheck((6, 18, 0))))]
 
     # 'self_protection', 'kspp'
     l += [CmdlineCheck('self_protection', 'kspp', 'slab_merge', 'is not set')]  # consequence of 'slab_nomerge' by kspp

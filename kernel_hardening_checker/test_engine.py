@@ -14,9 +14,11 @@ This module performs unit-testing of the kernel-hardening-checker engine.
 import io
 import sys
 import unittest
-from typing import Optional, Union
+from collections.abc import Iterator
+from typing import Any, Optional, Union
 from unittest import mock
 
+from .checks import add_cmdline_checks, add_kconfig_checks
 from .engine import (
     AND,
     OR,
@@ -875,3 +877,122 @@ CONFIG_NAME_8                         |kconfig|     reason_8     |decision_8| ex
             self.assertEqual(no_color,
                              [colorize_result('OK'),
                               colorize_result('FAIL: expected_1')])
+
+
+def _check_leaves(check: Any) -> Iterator[Any]:
+    if isinstance(check, (AND, OR)):
+        for child in check.opts:
+            yield from _check_leaves(child)
+    else:
+        yield check
+
+
+def _find_check(checklist: list[Any], check_type: type[Any], name: str, expected: str) -> Any:
+    for candidate in checklist:
+        if any(isinstance(leaf, check_type) and leaf.name == name and leaf.expected == expected
+               for leaf in _check_leaves(candidate)):
+            return candidate
+    raise AssertionError(f'check not found: {name} {expected}')
+
+
+def _reset_check(check: Any) -> None:
+    check.result = None
+    if isinstance(check, (AND, OR)):
+        for child in check.opts:
+            _reset_check(child)
+    elif isinstance(check, VersionCheck):
+        check.ver = (0, 0, 0)
+    else:
+        check.state = None
+
+
+def _synthetic_check_passes(check: Any,
+                            kconfig: Optional[dict[str, str]] = None,
+                            cmdline: Optional[dict[str, str]] = None,
+                            version: Optional[tuple[int, int, int]] = (6, 18, 0)) -> bool:
+    _reset_check(check)
+    checklist = [check]
+    if kconfig is not None:
+        populate_with_data(checklist, kconfig, 'kconfig')
+    if cmdline is not None:
+        populate_with_data(checklist, cmdline, 'cmdline')
+    if version is not None:
+        populate_with_data(checklist, version, 'version')
+    perform_checks(checklist)
+    return check.result.startswith('OK')
+
+
+class TestKernelVersionAndConfigurationChecks(unittest.TestCase):
+    """Exercise checks with synthetic kernel configuration data only."""
+
+    def test_rodata_full_kconfig_option_removed_in_linux_618(self) -> None:
+        checks: list[ChecklistObjType] = []
+        add_kconfig_checks(checks, 'ARM64')
+        check = _find_check(checks, KconfigCheck, 'CONFIG_RODATA_FULL_DEFAULT_ENABLED', 'y')
+
+        self.assertTrue(_synthetic_check_passes(check, version=(6, 18, 0)))
+        self.assertTrue(_synthetic_check_passes(
+            check, {'CONFIG_RODATA_FULL_DEFAULT_ENABLED': 'y'}, version=(6, 17, 0)))
+        self.assertFalse(_synthetic_check_passes(check, version=(6, 17, 0)))
+
+    def test_arm64_rodata_cmdline_is_version_aware(self) -> None:
+        checks: list[ChecklistObjType] = []
+        add_cmdline_checks(checks, 'ARM64')
+        check = _find_check(checks, CmdlineCheck, 'rodata', 'full')
+
+        self.assertTrue(_synthetic_check_passes(check, cmdline={'rodata': 'on'}, version=(6, 18, 0)))
+        self.assertFalse(_synthetic_check_passes(check, cmdline={'rodata': 'on'}, version=(6, 17, 0)))
+        self.assertTrue(_synthetic_check_passes(check, version=(6, 18, 0)))
+        self.assertTrue(_synthetic_check_passes(
+            check, {'CONFIG_RODATA_FULL_DEFAULT_ENABLED': 'y'}, version=(6, 17, 0)))
+        self.assertTrue(_synthetic_check_passes(check, cmdline={'rodata': 'full'}, version=(6, 18, 0)))
+        self.assertFalse(_synthetic_check_passes(check, cmdline={'rodata': 'noalias'}, version=(6, 18, 0)))
+
+    def test_cfi_symbol_rename_supports_old_and_compiler_neutral_names(self) -> None:
+        checks: list[ChecklistObjType] = []
+        add_kconfig_checks(checks, 'X86_64')
+        check = _find_check(checks, KconfigCheck, 'CONFIG_DEBUG_NOTIFIERS', 'y')
+
+        self.assertTrue(_synthetic_check_passes(check, {'CONFIG_CFI_CLANG': 'y', 'CONFIG_CFI_PERMISSIVE': 'is not set', 'CONFIG_CC_IS_CLANG': 'y'}))
+        self.assertTrue(_synthetic_check_passes(check, {'CONFIG_CFI': 'y', 'CONFIG_CFI_PERMISSIVE': 'is not set', 'CONFIG_CC_IS_GCC': 'y'}))
+        self.assertFalse(_synthetic_check_passes(check, {'CONFIG_CFI': 'y', 'CONFIG_CFI_PERMISSIVE': 'y'}))
+
+    def test_kmalloc_partition_symbol_rename_accepts_both_names(self) -> None:
+        checks: list[ChecklistObjType] = []
+        add_kconfig_checks(checks, 'X86_64')
+        check = _find_check(checks, KconfigCheck, 'CONFIG_KMALLOC_PARTITION_CACHES', 'y')
+
+        self.assertTrue(_synthetic_check_passes(check, {'CONFIG_RANDOM_KMALLOC_CACHES': 'y'}))
+        self.assertTrue(_synthetic_check_passes(check, {'CONFIG_KMALLOC_PARTITION_CACHES': 'y'}))
+        self.assertFalse(_synthetic_check_passes(check, {
+            'CONFIG_RANDOM_KMALLOC_CACHES': 'is not set', 'CONFIG_KMALLOC_PARTITION_CACHES': 'is not set'}))
+
+    def test_x86_lsm_mmap_min_addr_only_applies_with_selinux(self) -> None:
+        checks: list[ChecklistObjType] = []
+        add_kconfig_checks(checks, 'X86_64')
+        check = _find_check(checks, KconfigCheck, 'CONFIG_LSM_MMAP_MIN_ADDR', '65536')
+
+        self.assertTrue(_synthetic_check_passes(check, {'CONFIG_SECURITY_SELINUX': 'is not set'}))
+        self.assertTrue(_synthetic_check_passes(check, {'CONFIG_SECURITY_SELINUX': 'is not set', 'CONFIG_LSM_MMAP_MIN_ADDR': '0'}))
+        self.assertFalse(_synthetic_check_passes(check, {'CONFIG_SECURITY_SELINUX': 'y'}))
+        self.assertTrue(_synthetic_check_passes(check, {'CONFIG_SECURITY_SELINUX': 'y', 'CONFIG_LSM_MMAP_MIN_ADDR': '65536'}))
+        self.assertFalse(_synthetic_check_passes(check, {'CONFIG_SECURITY_SELINUX': 'y', 'CONFIG_LSM_MMAP_MIN_ADDR': '32768'}))
+
+    def test_arm_lsm_mmap_min_addr_only_applies_with_selinux(self) -> None:
+        checks: list[ChecklistObjType] = []
+        add_kconfig_checks(checks, 'ARM')
+        check = _find_check(checks, KconfigCheck, 'CONFIG_LSM_MMAP_MIN_ADDR', '32768')
+
+        self.assertTrue(_synthetic_check_passes(check, {'CONFIG_SECURITY_SELINUX': 'is not set'}))
+        self.assertFalse(_synthetic_check_passes(check, {'CONFIG_SECURITY_SELINUX': 'y'}))
+        self.assertTrue(_synthetic_check_passes(check, {'CONFIG_SECURITY_SELINUX': 'y', 'CONFIG_LSM_MMAP_MIN_ADDR': '32768'}))
+
+    def test_arm64_lsm_mmap_min_addr_preserves_compat_constraint(self) -> None:
+        checks: list[ChecklistObjType] = []
+        add_kconfig_checks(checks, 'ARM64')
+        check = _find_check(checks, KconfigCheck, 'CONFIG_LSM_MMAP_MIN_ADDR', '65536')
+
+        self.assertTrue(_synthetic_check_passes(check, {'CONFIG_SECURITY_SELINUX': 'is not set'}))
+        self.assertFalse(_synthetic_check_passes(check, {'CONFIG_SECURITY_SELINUX': 'y'}))
+        self.assertTrue(_synthetic_check_passes(check, {'CONFIG_SECURITY_SELINUX': 'y', 'CONFIG_LSM_MMAP_MIN_ADDR': '65536', 'CONFIG_COMPAT': 'is not set'}))
+        self.assertFalse(_synthetic_check_passes(check, {'CONFIG_SECURITY_SELINUX': 'y', 'CONFIG_LSM_MMAP_MIN_ADDR': '65536', 'CONFIG_COMPAT': 'y'}))
